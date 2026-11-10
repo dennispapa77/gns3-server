@@ -45,6 +45,17 @@ class TestUserRoutes:
         assert response.status_code == status.HTTP_201_CREATED
         assert response.json()["auth_source"] == "local"
 
+    async def test_create_user_with_dots_and_at_sign(self, app: FastAPI, client: AsyncClient) -> None:
+
+        new_user = {
+            "username": "first.last@domain.com",
+            "email": "first.last@domain.com",
+            "password": "placeholder_password",
+        }
+        response = await client.post(app.url_path_for("create_user"), json=new_user)
+        assert response.status_code == status.HTTP_201_CREATED
+        assert response.json()["username"] == "first.last@domain.com"
+
     async def test_users_can_register_successfully(
         self, app: FastAPI, client: AsyncClient, db_session: AsyncSession
     ) -> None:

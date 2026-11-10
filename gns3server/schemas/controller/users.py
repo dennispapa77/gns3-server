@@ -29,7 +29,7 @@ class UserBase(BaseModel):
     Common user properties.
     """
 
-    username: Optional[str] = Field(None, min_length=3, pattern="[a-zA-Z0-9_-]+$")
+    username: Optional[str] = Field(None, min_length=3, pattern=r"^[a-zA-Z0-9_.@-]+$")
     is_active: bool = True
     email: Optional[EmailStr] = None
     full_name: Optional[str] = None
@@ -40,7 +40,7 @@ class UserCreate(UserBase):
     Properties to create a user.
     """
 
-    username: str = Field(..., min_length=3, pattern="[a-zA-Z0-9_-]+$")
+    username: str = Field(..., min_length=3, pattern=r"^[a-zA-Z0-9_.@-]+$")
     password: SecretStr = Field(..., min_length=8, max_length=100)
 
 
