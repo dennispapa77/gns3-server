@@ -181,3 +181,25 @@ async def test_ldap_service_account_bind_failure(mock_ldap_server, default_setti
 
     profile = await service.authenticate("alice", "mock_alice_password", default_settings)
     assert profile is None
+
+
+async def test_ldap_test_connection_success(mock_ldap_server, default_settings):
+    service = LDAPService(server=mock_ldap_server, client_strategy=MOCK_SYNC)
+
+    result = await service.test_connection(default_settings)
+    assert result["status"] == "success"
+    assert result["bind_successful"] is True
+    assert result["user_search_successful"] is True
+    assert result["users_found"] >= 2
+    assert result["latency_ms"] >= 0
+
+
+async def test_ldap_test_connection_bind_failure(mock_ldap_server, default_settings):
+    default_settings.bind_password = SecretStr("wrong_password")
+    service = LDAPService(server=mock_ldap_server, client_strategy=MOCK_SYNC)
+
+    result = await service.test_connection(default_settings)
+    assert result["status"] == "error"
+    assert result["bind_successful"] is False
+    assert result["user_search_successful"] is False
+    assert "Failed to bind" in result["message"]

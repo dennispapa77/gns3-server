@@ -259,3 +259,12 @@ class SettingsUpdateResponse(SettingsResponse):
         default_factory=list,
         description="Changed 'Section.option' settings that require a server restart to take effect",
     )
+
+
+class LDAPTestConnectionResponse(BaseModel):
+    status: str = Field(description="Result status ('success' or 'error')")
+    bind_successful: bool = Field(description="Whether binding to the LDAP server succeeded")
+    user_search_successful: bool = Field(description="Whether user search query executed successfully")
+    users_found: int = Field(0, description="Number of user entries found during canary search")
+    latency_ms: float = Field(description="Round-trip latency in milliseconds")
+    message: str = Field(description="Diagnostic outcome or error message")

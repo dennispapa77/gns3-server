@@ -303,3 +303,52 @@ class TestSettingsRoutes:
         assert parsed["LDAP"]["uri"] == "ldaps://ldap.example.com:636"
         assert parsed["LDAP"]["bind_password"] == "placeholder_password"
         assert json.loads(parsed["LDAP"]["group_mapping"]) == {"GNS3-Admins": "Administrators"}
+
+    async def test_post_test_ldap_connection(self, app: FastAPI, client: AsyncClient, config: Config) -> None:
+        from ldap3 import ALL, MOCK_SYNC, Connection, Server
+
+        from gns3server.services import ldap_service
+
+        server = Server("mock_ldap_test", get_info=ALL)
+        conn = Connection(
+            server,
+            user="cn=admin,dc=example,dc=com",
+            password="placeholder_password",
+            client_strategy=MOCK_SYNC,
+        )
+        conn.bind()
+        conn.strategy.add_entry(
+            "cn=admin,dc=example,dc=com",
+            {"userPassword": "placeholder_password", "cn": "admin"},
+        )
+        conn.strategy.add_entry(
+            "uid=testuser,ou=users,dc=example,dc=com",
+            {"objectClass": ["person"], "uid": "testuser"},
+        )
+
+        orig_server = ldap_service._server
+        orig_strategy = ldap_service._client_strategy
+        ldap_service._server = server
+        ldap_service._client_strategy = MOCK_SYNC
+
+        try:
+            response = await client.post(
+                app.url_path_for("test_ldap_connection"),
+                json={
+                    "enabled": True,
+                    "uri": "ldap://mock_ldap_test:389",
+                    "bind_dn": "cn=admin,dc=example,dc=com",
+                    "bind_password": "placeholder_password",
+                    "base_dn": "ou=users,dc=example,dc=com",
+                },
+            )
+            assert response.status_code == status.HTTP_200_OK
+            body = response.json()
+            assert body["status"] == "success"
+            assert body["bind_successful"] is True
+            assert body["user_search_successful"] is True
+            assert body["users_found"] >= 1
+            assert "Successfully connected" in body["message"]
+        finally:
+            ldap_service._server = orig_server
+            ldap_service._client_strategy = orig_strategy

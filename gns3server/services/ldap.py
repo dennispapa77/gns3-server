@@ -292,3 +292,94 @@ class LDAPService:
             return None
 
         return await asyncio.to_thread(self._sync_authenticate, username, password, settings)
+
+    def _sync_test_connection(self, settings: LDAPSettings) -> Dict[str, Any]:
+        """
+        Synchronously attempt binding and canary search against the LDAP directory.
+        """
+        import time
+
+        t0 = time.perf_counter()
+        server = self._server or self._create_server(settings)
+        bind_user = settings.bind_dn
+        bind_password = settings.bind_password.get_secret_value() if settings.bind_password else None
+
+        conn = self._create_connection(server, bind_user, bind_password, settings.timeout)
+        try:
+            if not self._bind_connection(conn, settings.start_tls, settings.uri):
+                latency = round((time.perf_counter() - t0) * 1000, 2)
+                error_desc = (
+                    str(conn.result.get("description", "Bind failed")) if conn.result else "Connection or bind failed"
+                )
+                return {
+                    "status": "error",
+                    "bind_successful": False,
+                    "user_search_successful": False,
+                    "users_found": 0,
+                    "latency_ms": latency,
+                    "message": f"Failed to bind to LDAP server: {error_desc}",
+                }
+
+            user_search_ok = False
+            users_found = 0
+            if settings.base_dn:
+                try:
+                    test_filter = settings.user_search_filter.format(username="*")
+                    conn.search(
+                        search_base=settings.base_dn,
+                        search_filter=test_filter,
+                        attributes=[settings.user_attr_username],
+                        size_limit=5,
+                    )
+                    user_search_ok = True
+                    users_found = len(conn.entries)
+                except Exception as e:
+                    log.warning("LDAP test search error: %s", e)
+                    user_search_ok = False
+
+            latency = round((time.perf_counter() - t0) * 1000, 2)
+            msg = f"Successfully connected to LDAP server in {latency}ms."
+            if settings.base_dn:
+                msg += f" Found {users_found} sample user(s) in base DN."
+
+            return {
+                "status": "success",
+                "bind_successful": True,
+                "user_search_successful": user_search_ok,
+                "users_found": users_found,
+                "latency_ms": latency,
+                "message": msg,
+            }
+
+        except LDAPException as e:
+            latency = round((time.perf_counter() - t0) * 1000, 2)
+            return {
+                "status": "error",
+                "bind_successful": False,
+                "user_search_successful": False,
+                "users_found": 0,
+                "latency_ms": latency,
+                "message": f"LDAP protocol error: {e}",
+            }
+        except Exception as e:
+            latency = round((time.perf_counter() - t0) * 1000, 2)
+            return {
+                "status": "error",
+                "bind_successful": False,
+                "user_search_successful": False,
+                "users_found": 0,
+                "latency_ms": latency,
+                "message": f"Connection error: {e}",
+            }
+        finally:
+            if conn.bound:
+                conn.unbind()
+
+    async def test_connection(self, settings: Optional[LDAPSettings] = None) -> Dict[str, Any]:
+        """
+        Test connection and canary query against LDAP server in a worker thread.
+        """
+        if settings is None:
+            settings = Config.instance().settings.LDAP
+
+        return await asyncio.to_thread(self._sync_test_connection, settings)
