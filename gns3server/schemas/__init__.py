@@ -16,7 +16,7 @@
 
 # General schemas
 from .common import ErrorMessage
-from .config import ServerConfig
+from .config import LDAPSettings, ServerConfig
 from .controller.appliances import Appliance, ApplianceVersion, ApplianceVersionCreate, ApplianceVersionV8
 from .controller.computes import (
     AutoIdlePC,
@@ -300,6 +300,7 @@ __all__ = [
     "ImageSyncRequest",
     "ImageType",
     "ImageUpload",
+    "LDAPSettings",
     "LLMModelConfigCreate",
     "LLMModelConfigData",
     "LLMModelConfigInheritedResponse",

@@ -43,6 +43,7 @@ class TestUserRoutes:
         new_user = {"username": "user1", "email": "user1@email.com", "password": "test_password"}
         response = await client.post(app.url_path_for("create_user"), json=new_user)
         assert response.status_code == status.HTTP_201_CREATED
+        assert response.json()["auth_source"] == "local"
 
     async def test_users_can_register_successfully(
         self, app: FastAPI, client: AsyncClient, db_session: AsyncSession
@@ -148,7 +149,9 @@ class TestUserRoutes:
 
         response = await client.get(app.url_path_for("get_users"))
         assert response.status_code == status.HTTP_200_OK
-        assert len(response.json()) == 4  # admin, user1, user2 and user3 should exist
+        users = response.json()
+        assert len(users) == 4  # admin, user1, user2 and user3 should exist
+        assert all(u["auth_source"] == "local" for u in users)
 
     async def test_delete_user_removes_ace_on_user_path(
         self, app: FastAPI, client: AsyncClient, db_session: AsyncSession

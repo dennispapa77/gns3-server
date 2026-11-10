@@ -159,6 +159,9 @@ async def update_logged_in_user(
     Update the current active user.
     """
 
+    if current_user.auth_source == "ldap" and user_update.password:
+        raise ControllerBadRequestError("Password cannot be changed for directory-authenticated users")
+
     if user_update.email and await users_repo.get_user_by_email(user_update.email):
         raise ControllerBadRequestError(f"Email '{user_update.email}' is already registered")
 
@@ -260,9 +263,14 @@ async def update_user(
     if user_update.email and await users_repo.get_user_by_email(user_update.email):
         raise ControllerBadRequestError(f"Email '{user_update.email}' is already registered")
 
-    user = await users_repo.update_user(user_id, user_update)
-    if not user:
+    existing_user = await users_repo.get_user(user_id)
+    if not existing_user:
         raise ControllerNotFoundError(f"User '{user_id}' not found")
+
+    if existing_user.auth_source == "ldap" and user_update.password:
+        raise ControllerBadRequestError("Password cannot be changed for directory-authenticated users")
+
+    user = await users_repo.update_user(user_id, user_update)
     return user
 
 

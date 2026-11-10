@@ -15,6 +15,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import configparser
+import json
 import os
 
 import pytest
@@ -49,7 +50,16 @@ class TestSettingsRoutes:
         response = await client.get(app.url_path_for("get_server_settings"))
         assert response.status_code == status.HTTP_200_OK
         body = response.json()
-        assert sorted(body.keys()) == ["Controller", "Dynamips", "IOU", "Qemu", "Server", "VPCS", "WebWireshark"]
+        assert sorted(body.keys()) == [
+            "Controller",
+            "Dynamips",
+            "IOU",
+            "LDAP",
+            "Qemu",
+            "Server",
+            "VPCS",
+            "WebWireshark",
+        ]
         # deprecated sections are not exposed
         assert "VirtualBox" not in body
         assert "VMware" not in body
@@ -59,6 +69,8 @@ class TestSettingsRoutes:
         # only generated when the server actually starts)
         assert body["Server"]["compute_password"] in ("", SECRET_MASK)
         assert body["Controller"]["default_admin_password"] in ("", SECRET_MASK)
+        assert body["LDAP"]["enabled"] is False
+        assert body["LDAP"]["uri"] == "ldap://localhost:389"
 
     async def test_get_settings_unauthorized(self, app: FastAPI, client: AsyncClient) -> None:
 
@@ -258,3 +270,36 @@ class TestSettingsRoutes:
         body = response.json()
         assert body["restart_required"] == []
         assert body["Server"]["host"]  # current values are returned
+
+    async def test_put_settings_ldap(
+        self, app: FastAPI, client: AsyncClient, config: Config, stable_jwt_secret: str
+    ) -> None:
+
+        response = await client.put(
+            app.url_path_for("update_server_settings"),
+            json={
+                "LDAP": {
+                    "enabled": True,
+                    "uri": "ldaps://ldap.example.com:636",
+                    "bind_dn": "cn=admin,dc=example,dc=com",
+                    "bind_password": "placeholder_password",
+                    "base_dn": "ou=users,dc=example,dc=com",
+                    "group_mapping": {"GNS3-Admins": "Administrators"},
+                }
+            },
+        )
+        assert response.status_code == status.HTTP_200_OK
+        body = response.json()
+        assert body["LDAP"]["enabled"] is True
+        assert body["LDAP"]["uri"] == "ldaps://ldap.example.com:636"
+        assert body["LDAP"]["bind_dn"] == "cn=admin,dc=example,dc=com"
+        assert body["LDAP"]["bind_password"] == SECRET_MASK
+        assert body["LDAP"]["group_mapping"] == {"GNS3-Admins": "Administrators"}
+        assert "LDAP.enabled" not in body["restart_required"]
+
+        parsed = configparser.ConfigParser()
+        parsed.read(config._main_config_file)
+        assert parsed["LDAP"]["enabled"] == "True"
+        assert parsed["LDAP"]["uri"] == "ldaps://ldap.example.com:636"
+        assert parsed["LDAP"]["bind_password"] == "placeholder_password"
+        assert json.loads(parsed["LDAP"]["group_mapping"]) == {"GNS3-Admins": "Administrators"}

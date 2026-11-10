@@ -133,7 +133,11 @@ async def update_server_settings(settings_update: schemas.SettingsUpdate) -> sch
     }
 
     # masked or empty secrets mean "unchanged": never write them back
-    for section, option in (("Server", "compute_password"), ("Controller", "default_admin_password")):
+    for section, option in (
+        ("Server", "compute_password"),
+        ("Controller", "default_admin_password"),
+        ("LDAP", "bind_password"),
+    ):
         if section in changes and changes[section].get(option) in ("", SECRET_MASK):
             del changes[section][option]
 

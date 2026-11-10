@@ -26,8 +26,10 @@ from sqlalchemy.orm import selectinload
 
 import gns3server.db.models as models
 from gns3server import schemas
+from gns3server.config import Config
 from gns3server.db.rbac_state import RbacState
-from gns3server.services import auth_service
+from gns3server.services import auth_service, ldap_service
+from gns3server.services.ldap import LDAPService, LDAPUserProfile
 
 from .base import BaseRepository
 
@@ -35,10 +37,11 @@ log = logging.getLogger(__name__)
 
 
 class UsersRepository(BaseRepository):
-    def __init__(self, db_session: AsyncSession) -> None:
+    def __init__(self, db_session: AsyncSession, ldap_service_instance: Optional[LDAPService] = None) -> None:
 
         super().__init__(db_session)
         self._auth_service = auth_service
+        self._ldap_service = ldap_service_instance or ldap_service
         self._rbac_state = RbacState.instance()
 
     async def get_user(self, user_id: UUID) -> Optional[models.User]:
@@ -139,34 +142,135 @@ class UsersRepository(BaseRepository):
         self._rbac_state.mark_dirty()
         return cast(CursorResult, result).rowcount > 0
 
+    async def _update_last_login(self, user: models.User) -> models.User:
+        """
+        Update user's last login timestamp without altering updated_at.
+        """
+
+        updated_at = user.updated_at
+        user.last_login = func.current_timestamp()
+        await self._db_session.commit()
+        user.updated_at = updated_at
+        await self._db_session.commit()
+        await self._db_session.refresh(user)
+        return user
+
+    async def sync_ldap_user(self, profile: LDAPUserProfile) -> models.User:
+        """
+        Provision or synchronize an LDAP authenticated user.
+        """
+
+        query = (
+            select(models.User)
+            .options(selectinload(models.User.groups))
+            .where(models.User.username == profile.username)
+        )
+        result = await self._db_session.execute(query)
+        user = result.scalars().first()
+
+        if not user:
+            email = profile.email
+            if email and await self.get_user_by_email(email):
+                log.warning("Email '%s' from LDAP is already in use by another account", email)
+                email = None
+
+            user = models.User(
+                username=profile.username,
+                email=email,
+                full_name=profile.full_name,
+                hashed_password=None,
+                auth_source="ldap",
+                is_active=True,
+                is_superadmin=False,
+            )
+            self._db_session.add(user)
+            await self._db_session.flush()
+        else:
+            update_data = {}
+            if profile.email and user.email != profile.email:
+                existing_email_user = await self.get_user_by_email(profile.email)
+                if not existing_email_user or existing_email_user.user_id == user.user_id:
+                    update_data["email"] = profile.email
+                else:
+                    log.warning(
+                        "Cannot update email for user '%s': email '%s' already in use",
+                        user.username,
+                        profile.email,
+                    )
+            if profile.full_name and user.full_name != profile.full_name:
+                update_data["full_name"] = profile.full_name
+
+            if update_data:
+                await self._db_session.execute(
+                    update(models.User).where(models.User.user_id == user.user_id).values(update_data)
+                )
+
+        # Resolve mapped group memberships
+        target_group_ids: List[UUID] = []
+        for group_name in profile.groups:
+            grp = await self.get_user_group_by_name(group_name)
+            if grp:
+                target_group_ids.append(grp.user_group_id)
+            else:
+                log.warning("LDAP mapped group '%s' not found in database", group_name)
+
+        if target_group_ids:
+            await self._db_session.execute(
+                delete(models.user_group_map).where(models.user_group_map.c.user_id == user.user_id)
+            )
+            for group_id in target_group_ids:
+                await self._db_session.execute(
+                    models.user_group_map.insert().values(user_id=user.user_id, user_group_id=group_id)
+                )
+
+        user = await self._update_last_login(user)
+        self._rbac_state.mark_dirty()
+        return user
+
     async def authenticate_user(self, username: str, password: str) -> Optional[models.User]:
         """
         Authenticate user.
         """
 
-        user = await self.get_user_by_username(username)
-        if not user:
+        local_user = await self.get_user_by_username(username)
+
+        # 1. Superadmin local check first for emergency recovery
+        if local_user and local_user.is_superadmin:
+            if local_user.hashed_password is None:
+                log.warning(
+                    f"User '{username}' has been authenticated without a password configured. Please set a new password."
+                )
+                return await self._update_last_login(local_user)
+            if self._auth_service.verify_password(password, local_user.hashed_password):
+                return await self._update_last_login(local_user)
+
+        # 2. LDAP authentication if enabled
+        ldap_config = Config.instance().settings.LDAP
+        if ldap_config.enabled:
+            ldap_profile = await self._ldap_service.authenticate(username, password, ldap_config)
+            if ldap_profile:
+                return await self.sync_ldap_user(ldap_profile)
+            if not ldap_config.fallback_to_local:
+                return None
+
+        # 3. Fallback to standard local database authentication
+        if not local_user:
             return None
-        # Allow user to be authenticated if hashed password in the db is null
-        # this is useful for manual password recovery like:
-        # sqlite3 gns3_controller.db "UPDATE users SET hashed_password = null WHERE username = 'admin';"
-        if user.hashed_password is None:
+
+        # Directory-managed accounts cannot authenticate using local database fallback
+        if local_user.auth_source == "ldap":
+            return None
+
+        if local_user.hashed_password is None:
             log.warning(
                 f"User '{username}' has been authenticated without a password configured. Please set a new password."
             )
-            return user
-        if not self._auth_service.verify_password(password, user.hashed_password):
+            return await self._update_last_login(local_user)
+
+        if not self._auth_service.verify_password(password, local_user.hashed_password):
             return None
 
-        # Backup the updated_at value
-        updated_at = user.updated_at
-        user.last_login = func.current_timestamp()
-        await self._db_session.commit()
-        # Restore the original updated_at value
-        # so it is not affected by the last login update
-        user.updated_at = updated_at
-        await self._db_session.commit()
-        return user
+        return await self._update_last_login(local_user)
 
     async def get_user_memberships(self, user_id: UUID) -> List[models.UserGroup]:
         """

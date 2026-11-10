@@ -50,6 +50,7 @@ class User(BaseTable):
     hashed_password = Column(String)
     last_login: Mapped[Optional[datetime]] = mapped_column(DateTime)
     token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
+    auth_source: Mapped[str] = mapped_column(String, default="local", nullable=False, server_default="local")
     is_active = Column(Boolean, default=True)
     is_superadmin = Column(Boolean, default=False)
     groups = relationship("UserGroup", secondary=user_group_map, back_populates="users")
@@ -68,6 +69,7 @@ def create_default_super_admin(target, connection, **kw):
         full_name="Super Administrator",
         hashed_password=hashed_password,
         is_superadmin=True,
+        auth_source="local",
     )
     connection.execute(stmt)
     connection.commit()
