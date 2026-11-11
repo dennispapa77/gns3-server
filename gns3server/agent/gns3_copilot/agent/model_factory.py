@@ -95,9 +95,13 @@ def _load_llm_config(
         llm_config.get("model"),
     )
 
+    provider = str(llm_config.get("provider", "")).strip().lower()
+    if provider in ("google", "gemini", "google-genai"):
+        provider = "google_genai"
+
     return {
         "model_name": llm_config.get("model", ""),
-        "model_provider": llm_config.get("provider", ""),
+        "model_provider": provider,
         "api_key": llm_config.get("api_key", ""),
         "base_url": llm_config.get("base_url", ""),
         "temperature": str(llm_config.get("temperature", "0")),

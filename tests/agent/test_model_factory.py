@@ -102,3 +102,10 @@ def test_empty_api_key_omitted(captured: dict[str, Any]) -> None:
 
     model_factory.create_title_model(_config(api_key=""))
     assert "api_key" not in captured
+
+
+@pytest.mark.parametrize("provider", ["google", "gemini", "google-genai", "google_genai"])
+def test_google_provider_normalization(captured: dict[str, Any], provider: str) -> None:
+    """Google provider aliases should normalize to google_genai for LangChain."""
+    model_factory.create_base_model(_config(provider=provider, model="gemini-2.5-flash"))
+    assert captured["model_provider"] == "google_genai"
