@@ -144,13 +144,17 @@ def create_base_model(
         init_params: dict[str, Any] = {
             "model": config_vars["model_name"],
             "model_provider": config_vars["model_provider"],
-            "api_key": config_vars["api_key"],
-            "base_url": config_vars["base_url"],
             "temperature": config_vars["temperature"],
             "configurable_fields": "any",
             "config_prefix": "foo",
             **_request_controls(llm_config),
         }
+
+        if config_vars["api_key"]:
+            init_params["api_key"] = config_vars["api_key"]
+
+        if config_vars["base_url"]:
+            init_params["base_url"] = config_vars["base_url"]
 
         # Disable DeepSeek thinking mode to avoid reasoning_content handling issues
         # DeepSeek models enable thinking mode by default, which returns reasoning_content
@@ -212,13 +216,17 @@ def create_title_model(
         init_params: dict[str, Any] = {
             "model": config_vars["model_name"],
             "model_provider": config_vars["model_provider"],
-            "api_key": config_vars["api_key"],
-            "base_url": config_vars["base_url"],
             "temperature": "1.0",  # Higher temperature for more creative titles
             "configurable_fields": "any",
             "config_prefix": "foo",
             **_request_controls(llm_config),
         }
+
+        if config_vars["api_key"]:
+            init_params["api_key"] = config_vars["api_key"]
+
+        if config_vars["base_url"]:
+            init_params["base_url"] = config_vars["base_url"]
 
         # Disable DeepSeek thinking mode to avoid reasoning_content handling issues
         # DeepSeek models enable thinking mode by default, which returns reasoning_content

@@ -75,3 +75,30 @@ def test_title_model_gets_the_same_controls(captured: dict[str, Any]) -> None:
     assert captured["timeout"] == model_factory.DEFAULT_REQUEST_TIMEOUT_S
     assert captured["max_retries"] == model_factory.DEFAULT_MAX_RETRIES
     assert captured["stream_usage"] is True
+
+
+def test_empty_base_url_omitted(captured: dict[str, Any]) -> None:
+    """Empty base_url must not be passed to init_chat_model (Issue #2936)."""
+    model_factory.create_base_model(_config(base_url=""))
+    assert "base_url" not in captured
+
+    model_factory.create_title_model(_config(base_url=""))
+    assert "base_url" not in captured
+
+
+def test_explicit_base_url_passed(captured: dict[str, Any]) -> None:
+    """Non-empty base_url must be passed to init_chat_model."""
+    model_factory.create_base_model(_config(base_url="https://api.openai.com/v1"))
+    assert captured["base_url"] == "https://api.openai.com/v1"
+
+    model_factory.create_title_model(_config(base_url="https://api.openai.com/v1"))
+    assert captured["base_url"] == "https://api.openai.com/v1"
+
+
+def test_empty_api_key_omitted(captured: dict[str, Any]) -> None:
+    """Empty api_key should be omitted for local providers like Ollama."""
+    model_factory.create_base_model(_config(api_key=""))
+    assert "api_key" not in captured
+
+    model_factory.create_title_model(_config(api_key=""))
+    assert "api_key" not in captured

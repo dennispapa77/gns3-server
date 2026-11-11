@@ -70,6 +70,21 @@ def format_error_message(error: Exception) -> str:
             "3. Provider is correctly configured"
         )
 
+    # Check for authentication errors (Issue #2936)
+    if (
+        "401" in error_str
+        or "unauthorized" in error_str.lower()
+        or "missing authentication header" in error_str.lower()
+    ):
+        logger.warning("Authentication failure in LLM API call: %s", error_str)
+        return (
+            "Authentication failed (401 Unauthorized). Please check:\n"
+            "1. Your API key is valid and correctly entered\n"
+            "2. If using OpenRouter, your API key must be from https://openrouter.ai (starts with 'sk-or-')\n"
+            "3. If using Anthropic directly, set provider to 'anthropic' with a key from https://platform.claude.com (starts with 'sk-ant-')\n"
+            "4. If using OpenAI directly, set provider to 'openai' with a key from https://platform.openai.com (starts with 'sk-')"
+        )
+
     # For other errors, return the original message
     return error_str
 
