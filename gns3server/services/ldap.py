@@ -338,9 +338,7 @@ class LDAPService:
                     user_search_ok = False
 
             latency = round((time.perf_counter() - t0) * 1000, 2)
-            msg = f"Successfully connected to LDAP server in {latency}ms."
-            if settings.base_dn:
-                msg += f" Found {users_found} sample user(s) in base DN."
+            msg = "Directory server bind successful"
 
             return {
                 "status": "success",

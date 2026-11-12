@@ -228,10 +228,23 @@ class TestLdapAuthentication:
         assert response.status_code == status.HTTP_400_BAD_REQUEST
         assert "Password cannot be changed for directory-authenticated users" in response.json()["message"]
 
-        # 2. Administrator tries to change Alice's password via PUT /{user_id}
+        # 2. Administrator tries to change Alice's password via PUT /{user_id} when LDAP is enabled
         admin_response = await client.put(
             app.url_path_for("update_user", user_id=user.user_id),
             json={"password": "mock_new_password"},
         )
         assert admin_response.status_code == status.HTTP_400_BAD_REQUEST
         assert "Password cannot be changed for directory-authenticated users" in admin_response.json()["message"]
+
+        # 3. When LDAP is disabled, Administrator can reset password and user becomes local
+        Config.instance().settings.LDAP.enabled = False
+        try:
+            admin_reset = await client.put(
+                app.url_path_for("update_user", user_id=user.user_id),
+                json={"password": "mock_new_password_123"},
+            )
+            assert admin_reset.status_code == status.HTTP_200_OK
+            updated_alice = await users_repo.get_user(user.user_id)
+            assert updated_alice.auth_source == "local"
+        finally:
+            Config.instance().settings.LDAP.enabled = True

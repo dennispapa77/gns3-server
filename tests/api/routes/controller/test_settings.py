@@ -348,7 +348,7 @@ class TestSettingsRoutes:
             assert body["bind_successful"] is True
             assert body["user_search_successful"] is True
             assert body["users_found"] >= 1
-            assert "Successfully connected" in body["message"]
+            assert "Directory server bind successful" in body["message"]
         finally:
             ldap_service._server = orig_server
             ldap_service._client_strategy = orig_strategy
