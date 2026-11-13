@@ -218,15 +218,16 @@ class UsersRepository(BaseRepository):
             else:
                 log.warning("LDAP mapped group '%s' not found in database", group_name)
 
-        if target_group_ids:
+        # Always synchronize user group memberships to match the current LDAP mapping
+        await self._db_session.execute(
+            delete(models.user_group_map).where(models.user_group_map.c.user_id == user.user_id)
+        )
+        for group_id in target_group_ids:
             await self._db_session.execute(
-                delete(models.user_group_map).where(models.user_group_map.c.user_id == user.user_id)
+                models.user_group_map.insert().values(user_id=user.user_id, user_group_id=group_id)
             )
-            for group_id in target_group_ids:
-                await self._db_session.execute(
-                    models.user_group_map.insert().values(user_id=user.user_id, user_group_id=group_id)
-                )
-        else:
+
+        if not target_group_ids:
             log.warning(
                 "No GNS3 groups were assigned to LDAP user '%s' (profile.groups: %s)", profile.username, profile.groups
             )
