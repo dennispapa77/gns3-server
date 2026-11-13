@@ -93,12 +93,15 @@ def _search_directory_groups(conn: Connection, user_dn: str, clean_username: str
     clean_user_dn = escape_filter_chars(user_dn)
     grp_filter = settings.group_search_filter.format(user_dn=clean_user_dn, username=clean_username)
     try:
-        conn.search(search_base=search_base, search_filter=grp_filter, attributes=["cn"])
+        conn.search(search_base=search_base, search_filter=grp_filter, attributes=["cn", "sAMAccountName"])
         for entry in conn.entries:
             groups.add(entry.entry_dn)
             cn = getattr(entry, "cn", None)
             if cn and cn.value:
                 groups.add(str(cn.value))
+            sam = getattr(entry, "sAMAccountName", None)
+            if sam and sam.value:
+                groups.add(str(sam.value))
     except Exception as e:
         log.warning("LDAP group search query failed for %s: %s", clean_username, e)
     return groups
