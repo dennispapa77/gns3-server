@@ -68,7 +68,7 @@ def _extract_entry_groups(user_entry: Any) -> Set[str]:
     Extract raw group identifiers from memberOf/member user entry attributes.
     """
     groups: Set[str] = set()
-    for attr_name in ("memberOf", "member"):
+    for attr_name in ("memberOf", "memberof", "member", "groups"):
         if not hasattr(user_entry, attr_name):
             continue
         attr = getattr(user_entry, attr_name)
@@ -93,17 +93,38 @@ def _search_directory_groups(conn: Connection, user_dn: str, clean_username: str
     clean_user_dn = escape_filter_chars(user_dn)
     grp_filter = settings.group_search_filter.format(user_dn=clean_user_dn, username=clean_username)
     try:
-        conn.search(search_base=search_base, search_filter=grp_filter, attributes=["cn", "sAMAccountName"])
+        conn.search(
+            search_base=search_base,
+            search_filter=grp_filter,
+            attributes=["cn", "sAMAccountName", "name", "distinguishedName"],
+        )
         for entry in conn.entries:
             groups.add(entry.entry_dn)
-            cn = getattr(entry, "cn", None)
-            if cn and cn.value:
-                groups.add(str(cn.value))
-            sam = getattr(entry, "sAMAccountName", None)
-            if sam and sam.value:
-                groups.add(str(sam.value))
+            for attr in ("cn", "sAMAccountName", "name"):
+                val = getattr(entry, attr, None)
+                if val and val.value:
+                    groups.add(str(val.value))
     except Exception as e:
         log.warning("LDAP group search query failed for %s: %s", clean_username, e)
+
+    # Active Directory recursive nested group search fallback if standard search found nothing
+    if not groups and "objectclass=group" in (settings.group_search_filter or "").lower():
+        ad_recursive_filter = f"(&(objectClass=group)(member:1.2.840.113556.1.4.1941:={clean_user_dn}))"
+        try:
+            conn.search(
+                search_base=search_base,
+                search_filter=ad_recursive_filter,
+                attributes=["cn", "sAMAccountName", "name"],
+            )
+            for entry in conn.entries:
+                groups.add(entry.entry_dn)
+                for attr in ("cn", "sAMAccountName", "name"):
+                    val = getattr(entry, attr, None)
+                    if val and val.value:
+                        groups.add(str(val.value))
+        except Exception as e:
+            log.debug("LDAP AD recursive group search skipped: %s", e)
+
     return groups
 
 
@@ -116,7 +137,7 @@ def _map_to_user_groups(raw_groups: Set[str], group_mapping: Dict[str, str], def
         cn = _extract_cn(raw_group)
         target_group = None
         for map_key, map_val in group_mapping.items():
-            if map_key.lower() in (raw_group.lower(), cn.lower()):
+            if map_key.lower() in (raw_group.lower(), cn.lower(), raw_group.strip().lower()):
                 target_group = map_val
                 break
         if target_group and target_group not in mapped_groups:
@@ -184,8 +205,20 @@ class LDAPService:
         settings: LDAPSettings,
     ) -> List[str]:
         raw_groups = _extract_entry_groups(user_entry)
-        raw_groups |= _search_directory_groups(conn, user_dn, clean_username, settings)
-        return _map_to_user_groups(raw_groups, settings.group_mapping or {}, settings.default_group)
+        searched_groups = _search_directory_groups(conn, user_dn, clean_username, settings)
+        all_raw_groups = raw_groups | searched_groups
+        mapped = _map_to_user_groups(all_raw_groups, settings.group_mapping or {}, settings.default_group)
+        log.info(
+            "LDAP group resolution for user '%s': memberOf=%s, directory_search=%s -> total_raw=%s -> mapped_to_gns3=%s (configured mapping: %s, default: '%s')",
+            clean_username,
+            raw_groups,
+            searched_groups,
+            all_raw_groups,
+            mapped,
+            settings.group_mapping,
+            settings.default_group,
+        )
+        return mapped
 
     def _verify_user_credentials(self, server: Server, user_dn: str, password: str, settings: LDAPSettings) -> bool:
         user_conn = self._create_connection(server, user_dn, password, settings.timeout)

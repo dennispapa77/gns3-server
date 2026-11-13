@@ -207,10 +207,14 @@ class UsersRepository(BaseRepository):
 
         # Resolve mapped group memberships
         target_group_ids: List[UUID] = []
+        log.info("Resolving mapped groups for LDAP user '%s' (profile.groups: %s)", profile.username, profile.groups)
         for group_name in profile.groups:
             grp = await self.get_user_group_by_name(group_name)
             if grp:
                 target_group_ids.append(grp.user_group_id)
+                log.info(
+                    "Assigned user '%s' to GNS3 group '%s' (UUID: %s)", profile.username, grp.name, grp.user_group_id
+                )
             else:
                 log.warning("LDAP mapped group '%s' not found in database", group_name)
 
@@ -222,6 +226,10 @@ class UsersRepository(BaseRepository):
                 await self._db_session.execute(
                     models.user_group_map.insert().values(user_id=user.user_id, user_group_id=group_id)
                 )
+        else:
+            log.warning(
+                "No GNS3 groups were assigned to LDAP user '%s' (profile.groups: %s)", profile.username, profile.groups
+            )
 
         user = await self._update_last_login(user)
         self._rbac_state.mark_dirty()
@@ -296,7 +304,7 @@ class UsersRepository(BaseRepository):
         Get a user group by its name.
         """
 
-        query = select(models.UserGroup).where(models.UserGroup.name == name)
+        query = select(models.UserGroup).where(func.lower(models.UserGroup.name) == name.lower())
         result = await self._db_session.execute(query)
         return result.scalars().first()
 
