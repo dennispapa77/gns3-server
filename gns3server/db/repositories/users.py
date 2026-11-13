@@ -58,7 +58,7 @@ class UsersRepository(BaseRepository):
         Get a user by its name.
         """
 
-        query = select(models.User).where(models.User.username == username)
+        query = select(models.User).where(func.lower(models.User.username) == username.lower())
         result = await self._db_session.execute(query)
         return result.scalars().first()
 
@@ -67,7 +67,7 @@ class UsersRepository(BaseRepository):
         Get a user by its email.
         """
 
-        query = select(models.User).where(models.User.email == email)
+        query = select(models.User).where(func.lower(models.User.email) == email.lower())
         result = await self._db_session.execute(query)
         return result.scalars().first()
 
@@ -155,57 +155,125 @@ class UsersRepository(BaseRepository):
         await self._db_session.refresh(user)
         return user
 
-    async def sync_ldap_user(self, profile: LDAPUserProfile) -> models.User:
-        """
-        Provision or synchronize an LDAP authenticated user.
-        """
-
+    async def _lookup_or_link_ldap_user(self, profile: LDAPUserProfile) -> Optional[models.User]:
         query = (
             select(models.User)
             .options(selectinload(models.User.groups))
-            .where(models.User.username == profile.username)
+            .where(func.lower(models.User.username) == profile.username.lower())
         )
         result = await self._db_session.execute(query)
         user = result.scalars().first()
 
-        if not user:
-            email = profile.email
-            if email and await self.get_user_by_email(email):
-                log.warning("Email '%s' from LDAP is already in use by another account", email)
+        # Link to existing LDAP account if user logged in previously with email/UPN vs shortname
+        if not user and profile.email:
+            email_query = (
+                select(models.User)
+                .options(selectinload(models.User.groups))
+                .where(
+                    models.User.auth_source == "ldap",
+                    func.lower(models.User.email) == profile.email.lower(),
+                )
+            )
+            email_res = await self._db_session.execute(email_query)
+            existing_ldap_user = email_res.scalars().first()
+            if existing_ldap_user:
+                user = existing_ldap_user
+                log.info(
+                    "Linking LDAP login for '%s' to existing account '%s' (user_id: %s) via email '%s'",
+                    profile.username,
+                    user.username,
+                    user.user_id,
+                    profile.email,
+                )
+                if user.username.lower() != profile.username.lower():
+                    existing_named_user = await self.get_user_by_username(profile.username)
+                    if not existing_named_user:
+                        log.info(
+                            "Updating username for user_id %s from '%s' to canonical '%s'",
+                            user.user_id,
+                            user.username,
+                            profile.username,
+                        )
+                        await self._db_session.execute(
+                            update(models.User)
+                            .where(models.User.user_id == user.user_id)
+                            .values(username=profile.username)
+                        )
+                        user.username = profile.username
+        return user
+
+    async def _create_or_adopt_ldap_user(self, profile: LDAPUserProfile) -> models.User:
+        email = profile.email
+        if email:
+            existing_email_user = await self.get_user_by_email(email)
+            if existing_email_user and existing_email_user.auth_source == "ldap":
+                log.info(
+                    "Adopting legacy LDAP account '%s' (user_id: %s) for canonical user '%s'",
+                    existing_email_user.username,
+                    existing_email_user.user_id,
+                    profile.username,
+                )
+                await self._db_session.execute(
+                    update(models.User)
+                    .where(models.User.user_id == existing_email_user.user_id)
+                    .values(username=profile.username, full_name=profile.full_name)
+                )
+                existing_email_user.username = profile.username
+                existing_email_user.full_name = profile.full_name
+                return existing_email_user
+            if existing_email_user:
+                log.warning("Email '%s' from LDAP is already in use by a local account", email)
                 email = None
 
-            user = models.User(
-                username=profile.username,
-                email=email,
-                full_name=profile.full_name,
-                hashed_password=None,
-                auth_source="ldap",
-                is_active=True,
-                is_superadmin=False,
-            )
-            self._db_session.add(user)
-            await self._db_session.flush()
-        else:
-            update_data = {}
-            if profile.email and user.email != profile.email:
-                existing_email_user = await self.get_user_by_email(profile.email)
-                if not existing_email_user or existing_email_user.user_id == user.user_id:
-                    update_data["email"] = profile.email
-                else:
-                    log.warning(
-                        "Cannot update email for user '%s': email '%s' already in use",
-                        user.username,
-                        profile.email,
-                    )
-            if profile.full_name and user.full_name != profile.full_name:
-                update_data["full_name"] = profile.full_name
+        user = models.User(
+            username=profile.username,
+            email=email,
+            full_name=profile.full_name,
+            hashed_password=None,
+            auth_source="ldap",
+            is_active=True,
+            is_superadmin=False,
+        )
+        self._db_session.add(user)
+        await self._db_session.flush()
+        return user
 
-            if update_data:
-                await self._db_session.execute(
-                    update(models.User).where(models.User.user_id == user.user_id).values(update_data)
+    async def _sync_user_profile_fields(self, user: models.User, profile: LDAPUserProfile) -> None:
+        update_data = {}
+        if profile.email and user.email != profile.email:
+            existing_email_user = await self.get_user_by_email(profile.email)
+            if not existing_email_user or existing_email_user.user_id == user.user_id:
+                update_data["email"] = profile.email
+            elif existing_email_user.auth_source == "ldap" and existing_email_user.user_id != user.user_id:
+                log.info(
+                    "Migrating email '%s' from legacy LDAP account '%s' to canonical user '%s'",
+                    profile.email,
+                    existing_email_user.username,
+                    user.username,
                 )
+                await self._db_session.execute(
+                    update(models.User).where(models.User.user_id == existing_email_user.user_id).values(email=None)
+                )
+                update_data["email"] = profile.email
+            else:
+                log.warning(
+                    "Cannot update email for user '%s': email '%s' already in use by another account",
+                    user.username,
+                    profile.email,
+                )
+        if profile.full_name and user.full_name != profile.full_name:
+            update_data["full_name"] = profile.full_name
 
-        # Resolve mapped group memberships
+        if update_data:
+            await self._db_session.execute(
+                update(models.User).where(models.User.user_id == user.user_id).values(update_data)
+            )
+            if "email" in update_data:
+                user.email = update_data["email"]
+            if "full_name" in update_data:
+                user.full_name = update_data["full_name"]
+
+    async def _sync_user_groups(self, user: models.User, profile: LDAPUserProfile) -> None:
         target_group_ids: List[UUID] = []
         log.info("Resolving mapped groups for LDAP user '%s' (profile.groups: %s)", profile.username, profile.groups)
         for group_name in profile.groups:
@@ -218,7 +286,6 @@ class UsersRepository(BaseRepository):
             else:
                 log.warning("LDAP mapped group '%s' not found in database", group_name)
 
-        # Always synchronize user group memberships to match the current LDAP mapping
         await self._db_session.execute(
             delete(models.user_group_map).where(models.user_group_map.c.user_id == user.user_id)
         )
@@ -231,6 +298,18 @@ class UsersRepository(BaseRepository):
             log.warning(
                 "No GNS3 groups were assigned to LDAP user '%s' (profile.groups: %s)", profile.username, profile.groups
             )
+
+    async def sync_ldap_user(self, profile: LDAPUserProfile) -> models.User:
+        """
+        Provision or synchronize an LDAP authenticated user.
+        """
+        user = await self._lookup_or_link_ldap_user(profile)
+        if not user:
+            user = await self._create_or_adopt_ldap_user(profile)
+        else:
+            await self._sync_user_profile_fields(user, profile)
+
+        await self._sync_user_groups(user, profile)
 
         user = await self._update_last_login(user)
         self._rbac_state.mark_dirty()

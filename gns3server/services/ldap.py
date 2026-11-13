@@ -240,22 +240,52 @@ class LDAPService:
         clean_username: str,
         settings: LDAPSettings,
     ) -> LDAPUserProfile:
-        canonical_username = username
-        user_attr = getattr(user_entry, settings.user_attr_username, None)
-        if user_attr and user_attr.value:
-            canonical_username = str(user_attr.value)
+        canonical_username = None
+
+        # 1. Primary: configured user_attr_username attribute
+        if settings.user_attr_username:
+            user_attr = getattr(user_entry, settings.user_attr_username, None)
+            if user_attr and user_attr.value:
+                canonical_username = str(user_attr.value).strip()
+
+        # 2. Secondary fallback across standard directory attributes
+        if not canonical_username:
+            for fallback_attr in ("sAMAccountName", "userPrincipalName", "uid", "cn"):
+                attr_val = getattr(user_entry, fallback_attr, None)
+                if attr_val and attr_val.value:
+                    canonical_username = str(attr_val.value).strip()
+                    break
+
+        # 3. Last resort: raw typed login string
+        if not canonical_username:
+            canonical_username = username.strip()
 
         email = None
-        email_attr = getattr(user_entry, settings.user_attr_email, None)
-        if email_attr and email_attr.value:
-            email = str(email_attr.value)
+        if settings.user_attr_email:
+            email_attr = getattr(user_entry, settings.user_attr_email, None)
+            if email_attr and email_attr.value:
+                email = str(email_attr.value).strip().lower()
+
+        if not email:
+            for fallback_email in ("mail", "userPrincipalName"):
+                em_val = getattr(user_entry, fallback_email, None)
+                if em_val and em_val.value and "@" in str(em_val.value):
+                    email = str(em_val.value).strip().lower()
+                    break
 
         full_name = None
         fn_attr = getattr(user_entry, settings.user_attr_fullname, None)
         if fn_attr and fn_attr.value:
-            full_name = str(fn_attr.value)
+            full_name = str(fn_attr.value).strip()
 
         groups = self._resolve_groups(conn, user_entry, user_dn, clean_username, settings)
+        log.info(
+            "Extracted LDAP profile for '%s': canonical_username='%s', email='%s', full_name='%s'",
+            username,
+            canonical_username,
+            email,
+            full_name,
+        )
         return LDAPUserProfile(
             username=canonical_username,
             email=email,
@@ -280,13 +310,21 @@ class LDAPService:
                 return None
 
             search_filter = settings.user_search_filter.format(username=clean_username)
-            attributes = [
-                settings.user_attr_username,
-                settings.user_attr_email,
-                settings.user_attr_fullname,
-                "memberOf",
-                "member",
-            ]
+            attributes = list(
+                {
+                    settings.user_attr_username,
+                    settings.user_attr_email,
+                    settings.user_attr_fullname,
+                    "sAMAccountName",
+                    "userPrincipalName",
+                    "uid",
+                    "cn",
+                    "mail",
+                    "displayName",
+                    "memberOf",
+                    "member",
+                }
+            )
             conn.search(search_base=settings.base_dn, search_filter=search_filter, attributes=attributes, size_limit=1)
 
             if not conn.entries:

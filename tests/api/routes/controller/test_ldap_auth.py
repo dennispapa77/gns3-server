@@ -248,3 +248,54 @@ class TestLdapAuthentication:
             assert updated_alice.auth_source == "local"
         finally:
             Config.instance().settings.LDAP.enabled = True
+
+    async def test_ldap_login_returns_canonical_username_in_token(
+        self, app: FastAPI, unauthorized_client: AsyncClient, mock_ldap_directory
+    ) -> None:
+        """
+        Verify that login response includes the canonical username.
+        """
+        response = await unauthorized_client.post(
+            app.url_path_for("login"), data={"username": "alice", "password": "mock_alice_secret"}, headers=FORM_HEADERS
+        )
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data.get("username") == "alice"
+
+    async def test_ldap_account_linking_by_email_prevents_duplicate_user(
+        self, app: FastAPI, unauthorized_client: AsyncClient, db_session: AsyncSession, config: Config, mock_ldap_directory
+    ) -> None:
+        """
+        Verify that logging in with an email and later logging in with a short name links to the exact same user_id.
+        """
+        config.settings.LDAP.user_search_filter = (
+            "(&(objectClass=person)(|(uid={username})(sAMAccountName={username})(mail={username})))"
+        )
+        users_repo = UsersRepository(db_session)
+
+        # 1. Login with email
+        resp1 = await unauthorized_client.post(
+            app.url_path_for("login"),
+            data={"username": "alice@example.com", "password": "mock_alice_secret"},
+            headers=FORM_HEADERS,
+        )
+        assert resp1.status_code == status.HTTP_200_OK
+        first_user = await users_repo.get_user_by_email("alice@example.com")
+        assert first_user is not None
+        first_user_id = first_user.user_id
+
+        # 2. Login with short username
+        resp2 = await unauthorized_client.post(
+            app.url_path_for("login"), data={"username": "alice", "password": "mock_alice_secret"}, headers=FORM_HEADERS
+        )
+        assert resp2.status_code == status.HTTP_200_OK
+
+        # 3. Verify user was linked, username updated to canonical, and no duplicate user exists
+        linked_user = await users_repo.get_user(first_user_id)
+        assert linked_user is not None
+        assert linked_user.username == "alice"
+        assert linked_user.email == "alice@example.com"
+
+        # Ensure only 1 user exists for Alice in database
+        all_alices = [u for u in await users_repo.get_users() if u.email == "alice@example.com"]
+        assert len(all_alices) == 1
