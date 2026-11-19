@@ -161,7 +161,7 @@ class TestUserRoutes:
         response = await client.get(app.url_path_for("get_users"))
         assert response.status_code == status.HTTP_200_OK
         users = response.json()
-        assert len(users) == 4  # admin, user1, user2 and user3 should exist
+        assert len(users) == 5  # admin, user1, first.last@domain.com, user2 and user3 should exist
         assert all(u["auth_source"] == "local" for u in users)
 
     async def test_delete_user_removes_ace_on_user_path(
