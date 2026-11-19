@@ -28,6 +28,12 @@ import gns3server.db.models as models
 from gns3server import schemas
 from gns3server.config import Config
 from gns3server.db.rbac_state import RbacState
+
+try:
+    from gns3server.db.user_quota_state import UserQuotaState
+except ImportError:
+    UserQuotaState = None  # type: ignore[assignment, misc]
+
 from gns3server.services import auth_service, ldap_service
 from gns3server.services.ldap import LDAPService, LDAPUserProfile
 
@@ -43,6 +49,7 @@ class UsersRepository(BaseRepository):
         self._auth_service = auth_service
         self._ldap_service = ldap_service_instance or ldap_service
         self._rbac_state = RbacState.instance()
+        self._quota_state = UserQuotaState.instance() if UserQuotaState else None
 
     async def get_user(self, user_id: UUID) -> Optional[models.User]:
         """
@@ -58,7 +65,7 @@ class UsersRepository(BaseRepository):
         Get a user by its name.
         """
 
-        query = select(models.User).where(models.User.username == username)
+        query = select(models.User).where(func.lower(models.User.username) == username.lower())
         result = await self._db_session.execute(query)
         return result.scalars().first()
 
@@ -67,7 +74,7 @@ class UsersRepository(BaseRepository):
         Get a user by its email.
         """
 
-        query = select(models.User).where(models.User.email == email)
+        query = select(models.User).where(func.lower(models.User.email) == email.lower())
         result = await self._db_session.execute(query)
         return result.scalars().first()
 
@@ -155,76 +162,219 @@ class UsersRepository(BaseRepository):
         await self._db_session.refresh(user)
         return user
 
-    async def sync_ldap_user(self, profile: LDAPUserProfile) -> models.User:
-        """
-        Provision or synchronize an LDAP authenticated user.
-        """
-
+    async def _lookup_or_link_ldap_user(self, profile: LDAPUserProfile) -> Optional[models.User]:
         query = (
             select(models.User)
             .options(selectinload(models.User.groups))
-            .where(models.User.username == profile.username)
+            .where(func.lower(models.User.username) == profile.username.lower())
         )
         result = await self._db_session.execute(query)
         user = result.scalars().first()
 
-        if not user:
-            email = profile.email
-            if email and await self.get_user_by_email(email):
-                log.warning("Email '%s' from LDAP is already in use by another account", email)
+        # Link to existing LDAP account if user logged in previously with email/UPN vs shortname
+        if not user and profile.email:
+            email_query = (
+                select(models.User)
+                .options(selectinload(models.User.groups))
+                .where(
+                    models.User.auth_source == "ldap",
+                    func.lower(models.User.email) == profile.email.lower(),
+                )
+            )
+            email_res = await self._db_session.execute(email_query)
+            existing_ldap_user = email_res.scalars().first()
+            if existing_ldap_user:
+                user = existing_ldap_user
+                log.info(
+                    "Linking LDAP login for '%s' to existing account '%s' (user_id: %s) via email '%s'",
+                    profile.username,
+                    user.username,
+                    user.user_id,
+                    profile.email,
+                )
+                if user.username.lower() != profile.username.lower():
+                    log.info(
+                        "LDAP login for '%s' linked to existing account '%s' (user_id: %s); retaining original username to preserve project ownership",
+                        profile.username,
+                        user.username,
+                        user.user_id,
+                    )
+        return user
+
+    async def _create_or_adopt_ldap_user(self, profile: LDAPUserProfile) -> models.User:
+        email = profile.email
+        if email:
+            existing_email_user = await self.get_user_by_email(email)
+            if existing_email_user and existing_email_user.auth_source == "ldap":
+                log.info(
+                    "Adopting legacy LDAP account '%s' (user_id: %s) for canonical user '%s'",
+                    existing_email_user.username,
+                    existing_email_user.user_id,
+                    profile.username,
+                )
+                await self._db_session.execute(
+                    update(models.User)
+                    .where(models.User.user_id == existing_email_user.user_id)
+                    .values(
+                        full_name=profile.full_name,
+                        is_superadmin=profile.is_superadmin,
+                    )
+                )
+                existing_email_user.full_name = profile.full_name
+                existing_email_user.is_superadmin = profile.is_superadmin
+                return existing_email_user
+            if existing_email_user:
+                log.warning("Email '%s' from LDAP is already in use by a local account", email)
                 email = None
 
-            user = models.User(
-                username=profile.username,
-                email=email,
-                full_name=profile.full_name,
-                hashed_password=None,
-                auth_source="ldap",
-                is_active=True,
-                is_superadmin=False,
-            )
-            self._db_session.add(user)
-            await self._db_session.flush()
-        else:
-            update_data = {}
-            if profile.email and user.email != profile.email:
-                existing_email_user = await self.get_user_by_email(profile.email)
-                if not existing_email_user or existing_email_user.user_id == user.user_id:
-                    update_data["email"] = profile.email
-                else:
-                    log.warning(
-                        "Cannot update email for user '%s': email '%s' already in use",
-                        user.username,
-                        profile.email,
-                    )
-            if profile.full_name and user.full_name != profile.full_name:
-                update_data["full_name"] = profile.full_name
+        user = models.User(
+            username=profile.username,
+            email=email,
+            full_name=profile.full_name,
+            hashed_password=None,
+            auth_source="ldap",
+            is_active=True,
+            is_superadmin=profile.is_superadmin,
+        )
+        self._db_session.add(user)
+        await self._db_session.flush()
+        return user
 
-            if update_data:
-                await self._db_session.execute(
-                    update(models.User).where(models.User.user_id == user.user_id).values(update_data)
+    async def _sync_user_profile_fields(self, user: models.User, profile: LDAPUserProfile) -> None:
+        update_data = {}
+
+        if user.auth_source != "ldap":
+            from gns3server.config import Config
+
+            if user.username.lower() != Config.instance().settings.Controller.default_admin_username.lower():
+                log.info("Transitioning local user '%s' to LDAP authenticated account", user.username)
+                update_data["auth_source"] = "ldap"
+
+        if profile.email and user.email != profile.email:
+            existing_email_user = await self.get_user_by_email(profile.email)
+            if not existing_email_user or existing_email_user.user_id == user.user_id:
+                update_data["email"] = profile.email
+            elif existing_email_user.auth_source == "ldap" and existing_email_user.user_id != user.user_id:
+                log.info(
+                    "Migrating email '%s' from legacy LDAP account '%s' to canonical user '%s'",
+                    profile.email,
+                    existing_email_user.username,
+                    user.username,
                 )
+                await self._db_session.execute(
+                    update(models.User).where(models.User.user_id == existing_email_user.user_id).values(email=None)
+                )
+                update_data["email"] = profile.email
+            else:
+                log.warning(
+                    "Cannot update email for user '%s': email '%s' already in use by another account",
+                    user.username,
+                    profile.email,
+                )
+        if profile.full_name and user.full_name != profile.full_name:
+            update_data["full_name"] = profile.full_name
 
-        # Resolve mapped group memberships
+        if user.is_superadmin != profile.is_superadmin:
+            log.info(
+                "Updating superadmin status for LDAP user '%s' from %s to %s",
+                user.username,
+                user.is_superadmin,
+                profile.is_superadmin,
+            )
+            update_data["is_superadmin"] = profile.is_superadmin
+
+        if update_data:
+            await self._db_session.execute(
+                update(models.User).where(models.User.user_id == user.user_id).values(update_data)
+            )
+            if "email" in update_data:
+                user.email = update_data["email"]
+            if "full_name" in update_data:
+                user.full_name = update_data["full_name"]
+            if "is_superadmin" in update_data:
+                user.is_superadmin = update_data["is_superadmin"]
+            if "auth_source" in update_data:
+                user.auth_source = update_data["auth_source"]
+
+    async def _sync_user_groups(self, user: models.User, profile: LDAPUserProfile) -> None:
         target_group_ids: List[UUID] = []
+        log.info("Resolving mapped groups for LDAP user '%s' (profile.groups: %s)", profile.username, profile.groups)
         for group_name in profile.groups:
             grp = await self.get_user_group_by_name(group_name)
             if grp:
                 target_group_ids.append(grp.user_group_id)
+                log.info(
+                    "Assigned user '%s' to GNS3 group '%s' (UUID: %s)", profile.username, grp.name, grp.user_group_id
+                )
             else:
                 log.warning("LDAP mapped group '%s' not found in database", group_name)
 
-        if target_group_ids:
-            await self._db_session.execute(
-                delete(models.user_group_map).where(models.user_group_map.c.user_id == user.user_id)
-            )
-            for group_id in target_group_ids:
-                await self._db_session.execute(
-                    models.user_group_map.insert().values(user_id=user.user_id, user_group_id=group_id)
+        unique_group_ids = list(dict.fromkeys(target_group_ids))
+
+        # Only synchronize memberships for groups governed by directory mappings or default group.
+        # This preserves existing memberships in local-only groups.
+        from gns3server.config import Config
+
+        ldap_config = Config.instance().settings.LDAP
+        managed_group_names = set(ldap_config.group_mapping.values())
+        if ldap_config.default_group:
+            managed_group_names.add(ldap_config.default_group)
+
+        # Ensure base privileges: if no mapped groups matched, fallback to default_group or 'Users'
+        if not unique_group_ids:
+            fallback_name = ldap_config.default_group or "Users"
+            fallback_grp = await self.get_user_group_by_name(fallback_name)
+            if not fallback_grp and fallback_name != "Users":
+                fallback_grp = await self.get_user_group_by_name("Users")
+            if fallback_grp:
+                unique_group_ids.append(fallback_grp.user_group_id)
+                managed_group_names.add(fallback_grp.name)
+                log.info(
+                    "Assigned fallback group '%s' to LDAP user '%s' to ensure base privileges",
+                    fallback_grp.name,
+                    profile.username,
                 )
+
+        managed_group_ids: List[UUID] = []
+        for name in managed_group_names:
+            grp = await self.get_user_group_by_name(name)
+            if grp:
+                managed_group_ids.append(grp.user_group_id)
+
+        if managed_group_ids:
+            await self._db_session.execute(
+                delete(models.user_group_map).where(
+                    models.user_group_map.c.user_id == user.user_id,
+                    models.user_group_map.c.user_group_id.in_(managed_group_ids),
+                )
+            )
+
+        for group_id in unique_group_ids:
+            await self._db_session.execute(
+                models.user_group_map.insert().values(user_id=user.user_id, user_group_id=group_id)
+            )
+
+        if not unique_group_ids:
+            log.warning(
+                "No GNS3 groups were assigned to LDAP user '%s' (profile.groups: %s)", profile.username, profile.groups
+            )
+
+    async def sync_ldap_user(self, profile: LDAPUserProfile) -> models.User:
+        """
+        Provision or synchronize an LDAP authenticated user.
+        """
+        user = await self._lookup_or_link_ldap_user(profile)
+        if not user:
+            user = await self._create_or_adopt_ldap_user(profile)
+        else:
+            await self._sync_user_profile_fields(user, profile)
+
+        await self._sync_user_groups(user, profile)
 
         user = await self._update_last_login(user)
         self._rbac_state.mark_dirty()
+        if self._quota_state:
+            self._quota_state.mark_dirty()
         return user
 
     async def authenticate_user(self, username: str, password: str) -> Optional[models.User]:
@@ -234,8 +384,8 @@ class UsersRepository(BaseRepository):
 
         local_user = await self.get_user_by_username(username)
 
-        # 1. Superadmin local check first for emergency recovery
-        if local_user and local_user.is_superadmin:
+        # 1. Superadmin local check first for emergency recovery (local accounts only)
+        if local_user and local_user.auth_source == "local" and local_user.is_superadmin:
             if local_user.hashed_password is None:
                 log.warning(
                     f"User '{username}' has been authenticated without a password configured. Please set a new password."
@@ -258,7 +408,8 @@ class UsersRepository(BaseRepository):
             return None
 
         # Directory-managed accounts cannot authenticate using local database fallback
-        if local_user.auth_source == "ldap":
+        # unless LDAP has been explicitly disabled globally (Disaster Recovery scenario)
+        if local_user.auth_source == "ldap" and Config.instance().settings.LDAP.enabled:
             return None
 
         if local_user.hashed_password is None:
@@ -296,7 +447,7 @@ class UsersRepository(BaseRepository):
         Get a user group by its name.
         """
 
-        query = select(models.UserGroup).where(models.UserGroup.name == name)
+        query = select(models.UserGroup).where(func.lower(models.UserGroup.name) == name.lower())
         result = await self._db_session.execute(query)
         return result.scalars().first()
 

@@ -27,7 +27,7 @@ import logging
 import os
 import ssl
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ldap3 import ALL, Connection, Server, Tls
 from ldap3.core.exceptions import LDAPException
@@ -37,6 +37,45 @@ from gns3server.config import Config
 from gns3server.schemas.config import LDAPSettings
 
 log = logging.getLogger(__name__)
+
+# truststore on macOS/Windows enforces OS keychain certificate validation even when
+# verify_mode is explicitly configured as ssl.CERT_NONE. Ensure CERT_NONE is respected across platforms:
+try:
+    import truststore._api as trust_api
+
+    if not getattr(trust_api, "_gns3_cert_none_patched", False):
+        orig_verify = trust_api._verify_peercerts
+
+        def _safe_verify_peercerts(sock_or_sslobj, server_hostname=None):
+            ctx = getattr(sock_or_sslobj, "context", None)
+            if ctx and getattr(ctx, "verify_mode", None) == ssl.CERT_NONE:
+                return
+            return orig_verify(sock_or_sslobj, server_hostname=server_hostname)
+
+        trust_api._verify_peercerts = _safe_verify_peercerts
+        trust_api._gns3_cert_none_patched = True
+except Exception:
+    pass
+
+
+def _format_ldap_error(e: Exception) -> str:
+    """
+    Format LDAPException or nested socket errors into clean, human-readable strings.
+    """
+    current: Any = e
+    while hasattr(current, "args") and current.args:
+        first = current.args[0]
+        if isinstance(first, (tuple, list)) and first:
+            current = first[0]
+        elif isinstance(first, Exception):
+            current = first
+        else:
+            current = first
+            break
+    msg = str(current)
+    for artifact in ("('", "')", '("', '")', "',)", '",)', "\\'"):
+        msg = msg.replace(artifact, "")
+    return msg.strip("(),'\" ")
 
 
 @dataclass
@@ -49,6 +88,7 @@ class LDAPUserProfile:
     email: Optional[str] = None
     full_name: Optional[str] = None
     groups: List[str] = field(default_factory=list)
+    is_superadmin: bool = False
 
 
 def _extract_cn(dn_or_name: str) -> str:
@@ -68,7 +108,7 @@ def _extract_entry_groups(user_entry: Any) -> Set[str]:
     Extract raw group identifiers from memberOf/member user entry attributes.
     """
     groups: Set[str] = set()
-    for attr_name in ("memberOf", "member"):
+    for attr_name in ("memberOf", "memberof", "member", "groups"):
         if not hasattr(user_entry, attr_name):
             continue
         attr = getattr(user_entry, attr_name)
@@ -93,14 +133,40 @@ def _search_directory_groups(conn: Connection, user_dn: str, clean_username: str
     clean_user_dn = escape_filter_chars(user_dn)
     grp_filter = settings.group_search_filter.format(user_dn=clean_user_dn, username=clean_username)
     try:
-        conn.search(search_base=search_base, search_filter=grp_filter, attributes=["cn"])
+        conn.search(
+            search_base=search_base,
+            search_filter=grp_filter,
+            attributes=["cn", "sAMAccountName", "name", "distinguishedName"],
+            size_limit=100,
+        )
         for entry in conn.entries:
             groups.add(entry.entry_dn)
-            cn = getattr(entry, "cn", None)
-            if cn and cn.value:
-                groups.add(str(cn.value))
+            for attr in ("cn", "sAMAccountName", "name"):
+                val = getattr(entry, attr, None)
+                if val and val.value:
+                    groups.add(str(val.value))
     except Exception as e:
         log.warning("LDAP group search query failed for %s: %s", clean_username, e)
+
+    # Active Directory recursive nested group search fallback if standard search found nothing
+    if not groups and "objectclass=group" in (settings.group_search_filter or "").lower():
+        ad_recursive_filter = f"(&(objectClass=group)(member:1.2.840.113556.1.4.1941:={clean_user_dn}))"
+        try:
+            conn.search(
+                search_base=search_base,
+                search_filter=ad_recursive_filter,
+                attributes=["cn", "sAMAccountName", "name"],
+                size_limit=100,
+            )
+            for entry in conn.entries:
+                groups.add(entry.entry_dn)
+                for attr in ("cn", "sAMAccountName", "name"):
+                    val = getattr(entry, attr, None)
+                    if val and val.value:
+                        groups.add(str(val.value))
+        except Exception as e:
+            log.debug("LDAP AD recursive group search skipped: %s", e)
+
     return groups
 
 
@@ -113,7 +179,7 @@ def _map_to_user_groups(raw_groups: Set[str], group_mapping: Dict[str, str], def
         cn = _extract_cn(raw_group)
         target_group = None
         for map_key, map_val in group_mapping.items():
-            if map_key.lower() in (raw_group.lower(), cn.lower()):
+            if map_key.lower() in (raw_group.lower(), cn.lower(), raw_group.strip().lower()):
                 target_group = map_val
                 break
         if target_group and target_group not in mapped_groups:
@@ -122,6 +188,20 @@ def _map_to_user_groups(raw_groups: Set[str], group_mapping: Dict[str, str], def
     if not mapped_groups and default_group:
         mapped_groups.append(default_group)
     return mapped_groups
+
+
+def _is_superadmin_member(raw_groups: Set[str], superadmin_groups: List[str]) -> bool:
+    """
+    Check if any raw group or its CN matches configured superadmin directory groups.
+    """
+    if not superadmin_groups:
+        return False
+    targets = {s.strip().lower() for s in superadmin_groups if s.strip()}
+    for raw_group in raw_groups:
+        cn = _extract_cn(raw_group).lower()
+        if raw_group.strip().lower() in targets or cn in targets:
+            return True
+    return False
 
 
 class LDAPService:
@@ -158,6 +238,7 @@ class LDAPService:
             user=user,
             password=password,
             auto_bind=False,
+            auto_referrals=False,
             receive_timeout=timeout,
             client_strategy=self._client_strategy,
         )
@@ -179,10 +260,31 @@ class LDAPService:
         user_dn: str,
         clean_username: str,
         settings: LDAPSettings,
-    ) -> List[str]:
+    ) -> Tuple[List[str], bool]:
         raw_groups = _extract_entry_groups(user_entry)
-        raw_groups |= _search_directory_groups(conn, user_dn, clean_username, settings)
-        return _map_to_user_groups(raw_groups, settings.group_mapping or {}, settings.default_group)
+        # In Active Directory, user_entry already includes all memberOf groups.
+        # Skip slow, domain-wide directory queries if groups were already extracted from the user entry.
+        if raw_groups:
+            searched_groups: Set[str] = set()
+        else:
+            searched_groups = _search_directory_groups(conn, user_dn, clean_username, settings)
+
+        all_raw_groups = raw_groups | searched_groups
+        mapped = _map_to_user_groups(all_raw_groups, settings.group_mapping or {}, settings.default_group)
+        is_superadmin = _is_superadmin_member(all_raw_groups, settings.superadmin_groups or [])
+        log.info(
+            "LDAP group resolution for user '%s': memberOf=%s, directory_search=%s -> total_raw=%s -> mapped_to_gns3=%s, is_superadmin=%s (configured mapping: %s, default: '%s', superadmin_groups: %s)",
+            clean_username,
+            raw_groups,
+            searched_groups,
+            all_raw_groups,
+            mapped,
+            is_superadmin,
+            settings.group_mapping,
+            settings.default_group,
+            settings.superadmin_groups,
+        )
+        return mapped, is_superadmin
 
     def _verify_user_credentials(self, server: Server, user_dn: str, password: str, settings: LDAPSettings) -> bool:
         user_conn = self._create_connection(server, user_dn, password, settings.timeout)
@@ -204,27 +306,59 @@ class LDAPService:
         clean_username: str,
         settings: LDAPSettings,
     ) -> LDAPUserProfile:
-        canonical_username = username
-        user_attr = getattr(user_entry, settings.user_attr_username, None)
-        if user_attr and user_attr.value:
-            canonical_username = str(user_attr.value)
+        canonical_username = None
+
+        # 1. Primary: configured user_attr_username attribute
+        if settings.user_attr_username:
+            user_attr = getattr(user_entry, settings.user_attr_username, None)
+            if user_attr and user_attr.value:
+                canonical_username = str(user_attr.value).strip()
+
+        # 2. Secondary fallback across standard directory attributes
+        if not canonical_username:
+            for fallback_attr in ("sAMAccountName", "userPrincipalName", "uid", "cn"):
+                attr_val = getattr(user_entry, fallback_attr, None)
+                if attr_val and attr_val.value:
+                    canonical_username = str(attr_val.value).strip()
+                    break
+
+        # 3. Last resort: raw typed login string
+        if not canonical_username:
+            canonical_username = username.strip()
 
         email = None
-        email_attr = getattr(user_entry, settings.user_attr_email, None)
-        if email_attr and email_attr.value:
-            email = str(email_attr.value)
+        if settings.user_attr_email:
+            email_attr = getattr(user_entry, settings.user_attr_email, None)
+            if email_attr and email_attr.value:
+                email = str(email_attr.value).strip().lower()
+
+        if not email:
+            for fallback_email in ("mail", "userPrincipalName"):
+                em_val = getattr(user_entry, fallback_email, None)
+                if em_val and em_val.value and "@" in str(em_val.value):
+                    email = str(em_val.value).strip().lower()
+                    break
 
         full_name = None
         fn_attr = getattr(user_entry, settings.user_attr_fullname, None)
         if fn_attr and fn_attr.value:
-            full_name = str(fn_attr.value)
+            full_name = str(fn_attr.value).strip()
 
-        groups = self._resolve_groups(conn, user_entry, user_dn, clean_username, settings)
+        groups, is_superadmin = self._resolve_groups(conn, user_entry, user_dn, clean_username, settings)
+        log.info(
+            "Extracted LDAP profile for '%s': canonical_username='%s', email='%s', full_name='%s', is_superadmin=%s",
+            username,
+            canonical_username,
+            email,
+            full_name,
+            is_superadmin,
+        )
         return LDAPUserProfile(
             username=canonical_username,
             email=email,
             full_name=full_name,
             groups=groups,
+            is_superadmin=is_superadmin,
         )
 
     def _sync_authenticate(self, username: str, password: str, settings: LDAPSettings) -> Optional[LDAPUserProfile]:
@@ -244,13 +378,21 @@ class LDAPService:
                 return None
 
             search_filter = settings.user_search_filter.format(username=clean_username)
-            attributes = [
-                settings.user_attr_username,
-                settings.user_attr_email,
-                settings.user_attr_fullname,
-                "memberOf",
-                "member",
-            ]
+            attributes = list(
+                {
+                    settings.user_attr_username,
+                    settings.user_attr_email,
+                    settings.user_attr_fullname,
+                    "sAMAccountName",
+                    "userPrincipalName",
+                    "uid",
+                    "cn",
+                    "mail",
+                    "displayName",
+                    "memberOf",
+                    "member",
+                }
+            )
             conn.search(search_base=settings.base_dn, search_filter=search_filter, attributes=attributes, size_limit=1)
 
             if not conn.entries:
@@ -338,9 +480,7 @@ class LDAPService:
                     user_search_ok = False
 
             latency = round((time.perf_counter() - t0) * 1000, 2)
-            msg = f"Successfully connected to LDAP server in {latency}ms."
-            if settings.base_dn:
-                msg += f" Found {users_found} sample user(s) in base DN."
+            msg = "Directory server bind successful"
 
             return {
                 "status": "success",
@@ -359,7 +499,7 @@ class LDAPService:
                 "user_search_successful": False,
                 "users_found": 0,
                 "latency_ms": latency,
-                "message": f"LDAP protocol error: {e}",
+                "message": f"LDAP protocol error: {_format_ldap_error(e)}",
             }
         except Exception as e:
             latency = round((time.perf_counter() - t0) * 1000, 2)
@@ -369,7 +509,7 @@ class LDAPService:
                 "user_search_successful": False,
                 "users_found": 0,
                 "latency_ms": latency,
-                "message": f"Connection error: {e}",
+                "message": f"Connection error: {_format_ldap_error(e)}",
             }
         finally:
             if conn.bound:
